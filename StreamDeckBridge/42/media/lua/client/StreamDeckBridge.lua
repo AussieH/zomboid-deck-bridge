@@ -1,17 +1,19 @@
 -- Stream Deck Bridge for Project Zomboid (Build 42), the companion mod of the Zomboid Deck plugin for Stream Deck.
 --
 -- Once a second it writes what your survivor can see about themselves to Zomboid\Lua\StreamDeck\state.json: health,
--- the moodles the game is showing, the time and weather, what is in your hands, your load and the car you are in. It
--- also reads Zomboid\Lua\StreamDeck\command.json, where the plugin leaves a key press, runs it with the game's own
--- action and empties the file.
+-- what the game's Health tab lists for each body part, the moodles the game is showing, the time and weather, what is
+-- in your hands, your load and the car you are in. It also reads Zomboid\Lua\StreamDeck\command.json, where the plugin
+-- leaves a key press, runs it with the game's own action and empties the file.
 --
--- Client-side only (media/lua/client), for the local player. It never changes a stat, spawns anything or reads what
--- the character cannot know: no hidden infection, no exact power or water shutoff date.
+-- Client-side only (media/lua/client), for the local player. It never changes a stat or spawns anything. The health
+-- section repeats the game's own Health tab and nothing more, so a zombie infection the tab does not show is never
+-- written. In single player it also writes how long the grid's power and the mains water have left, worked out with
+-- the game's own rule; on a server (isClient()) it leaves that out and writes only whether they are on.
 
 StreamDeckBridge = StreamDeckBridge or {}
 local B = StreamDeckBridge
 
-B.VERSION = "1.0.0"
+B.VERSION = "1.1.0"
 B.PROTOCOL = 1
 B.STATE_FILE = "StreamDeck/state.json"
 B.COMMAND_FILE = "StreamDeck/command.json"
@@ -234,8 +236,20 @@ local function readWeather(player)
     }
 end
 
+-- The world's age in days as the shutoff rules count it: GameTime.getWorldAgeDaysSinceBegin() is
+-- getWorldAgeHours() / 24 + (SandboxOptions.getTimeSinceApo() - 1) * 30 (javap, 42.21); the same sum by hand if that
+-- getter ever goes.
+local function worldDays()
+    local gt = getGameTime()
+    local d = num(try(function() return gt:getWorldAgeDaysSinceBegin() end))
+    if d then return d end
+    return gt:getWorldAgeHours() / 24 + (getSandboxOptions():getTimeSinceApo() - 1) * 30
+end
+B.worldDays = worldDays
+
 -- Where you are: indoors or out, how light it is on your square, and whether the grid's power and the mains water are
--- still on. Those two are only on or off, as a lamp or a tap would show; the day they stop stays the game's secret.
+-- still on. Water follows the game's own test, IsoObject.isWaterInfinite() and ParameterWaterSupply (javap, 42.21):
+-- the taps run while the world's age in days is below WaterShutModifier.
 local function readPlace(player)
     local sq = player:getCurrentSquare()
     local out = {
@@ -246,10 +260,206 @@ local function readPlace(player)
         out.light = num(try(function() return sq:getLightLevel(player:getPlayerNum()) end))
         out.power = try(function() return sq:haveElectricity() end)
     end
-    out.water = try(function()
-        local days = getGameTime():getWorldAgeHours() / 24 + (getSandboxOptions():getTimeSinceApo() - 1) * 30
-        return days < getSandboxOptions():getWaterShutModifier()
-    end)
+    out.water = try(function() return worldDays() < getSandboxOptions():getWaterShutModifier() end)
+    return out
+end
+
+-- How long the grid's power and the mains water have left, in single player only. The rules, read with javap from
+-- Build 42.21's projectzomboid.jar:
+--   power: SandboxOptions.doesPowerGridExist() is IsoWorld.getWorldAgeDays() <= ElecShutModifier, where
+--          getWorldAgeDays() is GameTime.getWorldAgeDaysSinceBegin(); once it is false,
+--          AmbientStreamManager.updatePowerSupply() plays the shutdown sound and its "ElectricityOff" marker turns
+--          IsoWorld.isHydroPowerOn() off (AmbientSoundManager does it after a timer), so the power goes once the days
+--          pass the modifier.
+--   water: IsoObject.isWaterInfinite() is false once getWorldAgeDaysSinceBegin() >= WaterShutModifier.
+--   Both modifiers run from -1 to 2147483647 (SandboxOptions' IntegerSandboxOptions). A new game sets them from the
+--   ElecShut / WaterShut choice (SandboxOptions.randomElectricityShut / randomWaterShut, called by
+--   client/OptionScreens/SandboxOptions.lua:951-952 and MainScreen.lua:1592-1596): "Instant" leaves -1, so the utility
+--   is off from the first day, and the last choice gives 2147483647, so it never goes.
+-- On a server (isClient()) nothing is written: knowing the day there would be an advantage over other players, so the
+-- keys show only on or off. If isClient() cannot be read, it counts as a server.
+B.NEVER = 2147483647
+local function shutoff(modifier, days, inclusive)
+    if modifier >= B.NEVER then return { never = true } end
+    local left = modifier - days
+    local off
+    if inclusive then off = left < 0 else off = left <= 0 end
+    return { hours = math.max(0, left * 24), off = off, instant = modifier < 0 or nil }
+end
+B.shutoff = shutoff
+local function readShutoff()
+    local mp = try(isClient)
+    if mp ~= false then return nil end
+    local days = worldDays()
+    local so = getSandboxOptions()
+    return {
+        power = try(function() return shutoff(so:getElecShutModifier(), days, true) end),
+        water = try(function() return shutoff(so:getWaterShutModifier(), days, false) end),
+    }
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- The Health tab: what media/lua/client/XpSystem/ISUI/ISHealthPanel.lua (Build 42.21) shows you about yourself, rule
+-- for rule, line numbers from that file. Its debug-only lines (ISHealthPanel.cheat is getDebug(), line 5) are left out:
+-- the bridge shows what a normal game shows. IsInfected() and getInfectionLevel() (a zombie infection) are never
+-- read; the panel never shows them, and only the wound infection it lists as "Infected" is here.
+-- ---------------------------------------------------------------------------------------------------------------
+-- The panel's text colours: injuries (0.89, 0.28, 0.28), treatments (0.28, 0.89, 0.28), a dirty bandage and an infected
+-- wound (1, 0.28, 0), minor muscle strain (1, 0.58, 0).
+B.RED, B.GREEN, B.ORANGE, B.AMBER = "#e34747", "#47e347", "#ff4700", "#ff9400"
+-- BodyPartType in index order, the order getBodyParts() and so the panel's list go in.
+B.BODY_PARTS = { "Hand_L", "Hand_R", "ForeArm_L", "ForeArm_R", "UpperArm_L", "UpperArm_R", "Torso_Upper", "Torso_Lower",
+    "Head", "Neck", "Groin", "UpperLeg_L", "UpperLeg_R", "LowerLeg_L", "LowerLeg_R", "Foot_L", "Foot_R" }
+
+local function text(key)
+    local t = try(getText, key)
+    if type(t) == "string" and t ~= "" then return t end
+    return key
+end
+-- " (Severe)" and the like, as the panel adds them after a wound's name.
+local function grade(key) return " (" .. text(key) .. ")" end
+
+-- Every line the panel draws under one body part, in its order, as { id, text, color }. The panel's "- " is left to
+-- the plugin, and spaces are tidied (the panel joins some names with an extra " ").
+function B.woundLines(bp, doctor)
+    local lines = {}
+    local function add(id, key, suffix, color)
+        local s = string.gsub(text(key) .. (suffix or ""), "%s+", " ")
+        s = string.gsub(string.gsub(s, "^ ", ""), " $", "")
+        lines[#lines + 1] = { id = id, text = s, color = color }
+    end
+    local f = function(name) return num(try(function() return bp[name](bp) end)) or 0 end
+    local yes = function(name) return try(function() return bp[name](bp) end) == true end
+    local bandaged = yes("bandaged")
+    -- 607-630: poultices on the part, in the treatments' green
+    if f("getPlantainFactor") > 0 then add("plantain", "ContextMenu_PlantainCataplasm", nil, B.GREEN) end
+    if f("getComfreyFactor") > 0 then add("comfrey", "ContextMenu_ComfreyCataplasm", nil, B.GREEN) end
+    if f("getGarlicFactor") > 0 then add("garlic", "ContextMenu_GarlicCataplasm", nil, B.GREEN) end
+    -- 631-641: scratched; a doctor above level 2 sees Severe over 17 scratch time, Moderate over 14
+    if yes("scratched") then
+        local t, s = f("getScratchTime"), nil
+        if doctor > 2 then if t > 17 then s = grade("IGUI_health_Severe") elseif t > 14 then s = grade("IGUI_health_Moderate") end end
+        add("scratched", "IGUI_health_Scratched", s, B.RED)
+    end
+    -- 649-659: cut (Laceration in English); the same grades on cut time
+    if yes("isCut") then
+        local t, s = f("getCutTime"), nil
+        if doctor > 2 then if t > 17 then s = grade("IGUI_health_Severe") elseif t > 14 then s = grade("IGUI_health_Moderate") end end
+        add("cut", "IGUI_health_Cut", s, B.RED)
+    end
+    -- 667-677: deep wound; a doctor above level 4 sees Severe over 10, Moderate over 8
+    if yes("deepWounded") then
+        local t, s = f("getDeepWoundTime"), nil
+        if doctor > 4 then if t > 10 then s = grade("IGUI_health_Severe") elseif t > 8 then s = grade("IGUI_health_Moderate") end end
+        add("deepWound", "IGUI_health_DeepWound", s, B.RED)
+    end
+    -- 683-685: bitten
+    if yes("bitten") then add("bitten", "IGUI_health_Bitten", nil, B.RED) end
+    -- 691-697: pain from this part over 10, heavy over 50
+    local pain = f("getAdditionalPain")
+    if pain > 10 then
+        if pain > 50 then add("heavyPain", "IGUI_health_HeavyPain", nil, B.RED) else add("pain", "IGUI_health_Pain", nil, B.RED) end
+    end
+    -- 704-730: muscle strain from 5, minor (orange) under 20
+    local stiff = f("getStiffness")
+    if stiff >= 5 then
+        if stiff < 20 then add("minorStiffness", "IGUI_health_MinorStiffness", nil, B.AMBER) else add("stiffness", "IGUI_health_Stiffness", nil, B.RED) end
+    end
+    -- 732-734: bleeding
+    if yes("bleeding") then add("bleeding", "IGUI_health_Bleeding", nil, B.RED) end
+    -- 740-750: a fracture with no splint; a doctor above level 6 sees Severe over 50, Moderate over 20
+    local fracture, splint = f("getFractureTime"), f("getSplintFactor")
+    if fracture > 0 and splint == 0 then
+        local s = nil
+        if doctor > 6 then if fracture > 50 then s = grade("IGUI_health_Severe") elseif fracture > 20 then s = grade("IGUI_health_Moderate") end end
+        add("fracture", "IGUI_health_Fracture", s, B.RED)
+    end
+    -- 756-766: splinted; a doctor above level 4 sees Good over a splint factor of 4, else Moderate over 2 fracture time
+    if splint > 0 then
+        local s = nil
+        if doctor > 4 then if splint > 4 then s = grade("IGUI_health_Good") elseif fracture > 2 then s = grade("IGUI_health_Moderate") end end
+        add("splinted", "IGUI_health_Splinted", s, B.GREEN)
+    end
+    -- 772-778: bandaged, or a dirty bandage once its life is used up
+    if bandaged then
+        if f("getBandageLife") > 0 then add("bandaged", "IGUI_health_Bandaged", nil, B.GREEN) else add("dirtyBandage", "IGUI_health_DirtyBandage", nil, B.ORANGE) end
+    end
+    -- 802-811: an infected wound, not under a bandage, once doctor level 9, or the wound's infection level x 10
+    -- reaches 2.5 minus the doctor level
+    if yes("isInfectedWound") and not bandaged then
+        if doctor > 8 or f("getWoundInfectionLevel") * 10 >= 2.5 - doctor then add("infected", "IGUI_health_Infected", nil, B.ORANGE) end
+    end
+    -- 812-815: a lodged bullet, not under a bandage
+    if yes("haveBullet") and not bandaged then add("bullet", "IGUI_health_LodgedBullet", nil, B.RED) end
+    -- 816-822: burned, not under a bandage; a doctor above level 4 sees Need Cleaning
+    if f("getBurnTime") > 0 and not bandaged then
+        local s = nil
+        if doctor > 4 and yes("isNeedBurnWash") then s = grade("IGUI_health_NeedCleaning") end
+        add("burned", "IGUI_health_Burned", s, B.RED)
+    end
+    -- 828-838: stitched; a doctor above level 6 sees Good over 40 stitch time, else Need Time
+    if yes("stitched") then
+        local s = nil
+        if doctor > 6 then if f("getStitchTime") > 40 then s = grade("IGUI_health_Good") else s = grade("IGUI_health_NeedTime") end end
+        add("stitched", "IGUI_health_Stitched", s, B.GREEN)
+    end
+    -- 844-847: lodged glass shards, not under a bandage
+    if yes("haveGlass") and not bandaged then add("glass", "IGUI_health_LodgedGlassShards", nil, B.RED) end
+    return lines
+end
+
+-- 523: the panel lists a part when it has an injury (BodyPart.HasInjury(): bitten, scratched, deep wound, bleeding, or
+-- any bite, scratch, cut, fracture or burn time, or a bullet), a bandage, stitches, a splint, pain over 10 or muscle
+-- strain over 5. (Its "isDebug and stiffness > 0" names no Lua global in 42.21, so it never applies.)
+function B.isListed(bp)
+    local f = function(name) return num(try(function() return bp[name](bp) end)) or 0 end
+    local yes = function(name) return try(function() return bp[name](bp) end) == true end
+    return yes("HasInjury") or yes("bandaged") or yes("stitched") or f("getSplintFactor") > 0 or f("getAdditionalPain") > 10 or f("getStiffness") > 5
+end
+
+-- 445-451: "Overall Body Status" in white, then NewHealthPanel.getDamageStatusString() (Java, javap 42.21): OK at 100,
+-- then by BodyDamage.getHealth() over 90, 80, 70, 60, 50, 40, 20, 10 and 0, else Deceased; drawn in (1, 1 - t, 1 - t)
+-- with t = (100 - health) / 100, never under 0.2.
+B.STATUS = { { 90, "IGUI_health_Slight_damage" }, { 80, "IGUI_health_Very_Minor_damage" }, { 70, "IGUI_health_Minor_damage" },
+    { 60, "IGUI_health_Moderate_damage" }, { 50, "IGUI_health_Severe_damage" }, { 40, "IGUI_health_Very_Severe_damage" },
+    { 20, "IGUI_health_Crital_damage" }, { 10, "IGUI_health_Highly_Crital_damage" }, { 0, "IGUI_health_Terminal_damage" } }
+function B.bodyStatus(health)
+    local key = "IGUI_health_Deceased"
+    if health == 100 then key = "IGUI_health_ok"
+    else
+        for _, s in ipairs(B.STATUS) do
+            if health > s[1] then key = s[2]; break end
+        end
+    end
+    local t = math.max((100 - health) / 100, 0.2)
+    local gb = math.floor(math.max(0, math.min(1, 1 - t)) * 255 + 0.5)
+    return { title = text("IGUI_health_Overall_Body_Status"), text = text(key), key = key,
+        color = string.format("#ff%02x%02x", gb, gb), health = health }
+end
+
+local function readBody(player)
+    local bd = player:getBodyDamage()
+    local out = {}
+    local health = num(try(function() return bd:getHealth() end))
+    if health then out.status = B.bodyStatus(health) end
+    -- 973: the panel's grades depend on the reader's Doctor skill, player:getPerkLevel(Perks.Doctor)
+    local doctor = num(try(function() return player:getPerkLevel(Perks.Doctor) end)) or 0
+    local parts = {}
+    local list = bd:getBodyParts()
+    for i = 1, list:size() do
+        local bp = list:get(i - 1)
+        if try(B.isListed, bp) then
+            local id = try(function() return BodyPartType.ToString(bp:getType()) end) or B.BODY_PARTS[i]
+            parts[#parts + 1] = {
+                id = id,
+                -- 592: the part's name as BodyPartType.getDisplayName gives it, in the player's language
+                name = try(function() return BodyPartType.getDisplayName(bp:getType()) end) or id,
+                health = num(try(function() return bp:getHealth() end)),
+                lines = try(B.woundLines, bp, doctor) or {},
+            }
+        end
+    end
+    out.parts = parts
     return out
 end
 
@@ -279,6 +489,7 @@ function B.readState()
     s.health = num(try(function() return player:getBodyDamage():getOverallBodyHealth() end))
     s.moodles = try(readMoodles, player) or {}
     s.stats = try(readStats, player)
+    -- Kept as it was for older plugins; the body section below has the whole Health tab.
     s.wounds = try(function()
         local bd = player:getBodyDamage()
         return { bitten = bd:getNumPartsBitten(), scratched = bd:getNumPartsScratched(), bleeding = bd:getNumPartsBleeding() }
@@ -293,6 +504,8 @@ function B.readState()
     s.vehicle = try(readVehicle, player)
     s.weather = try(readWeather, player)
     s.place = try(readPlace, player)
+    s.shutoff = try(readShutoff)
+    s.body = try(readBody, player)
     s.zombies = try(function()
         local st = player:getStats()
         return { visible = st:getNumVisibleZombies(), chasing = st:getNumChasingZombies() }

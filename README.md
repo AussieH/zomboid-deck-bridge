@@ -5,14 +5,18 @@ is a small client-side Build 42 mod: once a second it writes what your survivor 
 `Zomboid\Lua\StreamDeck\state.json`, which the plugin draws its keys from, and it runs the few key presses the plugin
 leaves in `Zomboid\Lua\StreamDeck\command.json`.
 
-It never changes a stat, spawns anything or reads what your character cannot know (no hidden infection, no exact
-power or water shutoff date), opens no network connection and only works for the local player. This repository is
+It never changes a stat or spawns anything, never writes a zombie infection the game's Health tab does not show, opens
+no network connection and only works for the local player. This repository is
 here so you can see exactly what it does: it is all in one file,
 [`StreamDeckBridge.lua`](StreamDeckBridge/42/media/lua/client/StreamDeckBridge.lua).
 
 ## What it reads
 
 - Overall health; how many body parts are bitten, scratched or bleeding.
+- The game's Health tab, rule for rule from `ISHealthPanel.lua`: the Overall Body Status line, and for each body part
+  the lines the tab lists (scratched, laceration, deep wound, bitten, bleeding, fracture, burned, a lodged bullet or
+  glass, an infected wound, pain, muscle strain, bandaged, stitched, splinted), in the game's words and colours. Grades
+  that depend on your Doctor skill follow it, as in the game.
 - The moodles the game is showing, with their level, whether they are good or bad and the game's own name for them.
 - The stats those moodles are made from (hunger, thirst, fatigue, endurance, stress, panic, boredom, unhappiness),
   never infection, zombie fever or sickness.
@@ -21,7 +25,10 @@ here so you can see exactly what it does: it is all in one file,
 - What is in your hands: name, condition, sharpness, and for guns the ammo, chamber, magazine and jams; lights and
   their battery.
 - Your load against what you can carry; hours survived and kills; zombies you can see and zombies chasing you.
-- Indoors or out, the light on your square, and whether the power and mains water are still on (on or off only).
+- Indoors or out, the light on your square, and whether the power and mains water are still on.
+- In single player, how long the power and the mains water have left, worked out with the game's own shutoff rule
+  (ElecShutModifier and WaterShutModifier against the world's age), including "Instant" and never. On a server it
+  leaves this out and writes only whether they are on, since knowing the day there would be an advantage.
 - The car you are in: speed, gear, fuel, engine running and its condition, headlights, and whether you are driving.
 - Whether you are sitting or asleep, the game is paused, or you are at the main menu.
 
