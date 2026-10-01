@@ -1,0 +1,10 @@
+name=Stream Deck Bridge
+id=StreamDeckBridge
+description=Puts your survivor on an Elgato Stream Deck: health, moodles, the time and weather, your weapon, your load and the car you are driving, read once a second into a small file in your Zomboid folder for the Zomboid Deck plugin. A few keys can also sit you down, stand you up, switch your flashlight or headlights, start the engine or stop what you are doing, using the game's own actions. Client-side only, no cheats, and nothing leaves your PC. Needs the Zomboid Deck plugin for Stream Deck.
+poster=poster.png
+icon=icon.png
+category=features
+author=TeaTime
+url=https://teatimeservers.ca/plugins/zomboid-deck
+modversion=0.1.1
+versionMin=42.20
