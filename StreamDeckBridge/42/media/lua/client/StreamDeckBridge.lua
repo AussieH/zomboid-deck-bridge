@@ -11,7 +11,7 @@
 StreamDeckBridge = StreamDeckBridge or {}
 local B = StreamDeckBridge
 
-B.VERSION = "0.1.1"
+B.VERSION = "1.0.0"
 B.PROTOCOL = 1
 B.STATE_FILE = "StreamDeck/state.json"
 B.COMMAND_FILE = "StreamDeck/command.json"
