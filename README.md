@@ -34,6 +34,10 @@ here so you can see exactly what it does: it is all in one file,
   and type, its Overall Condition, weight and engine power, and every part by category with its condition in the
   window's colours ("Missing" for a part that has been taken off, and the battery's and gas tank's "% Remaining"),
   plus which parts the car overlay draws. The window's debug-mode lines are left out.
+- The rest of the game's character window, tab by tab: Info (profession, traits, weight and its trend, hair, favourite
+  weapon, kills, time survived), Skills (every skill's level, progress, starting boost and skill-book multiplier),
+  Protection (bite and scratch protection per body part) and Temperature (the core temperature and body heat bars and
+  the per-part views). The tabs' debug-mode extras, such as the raw temperature numbers, are never read.
 - Whether you are sitting or asleep, the game is paused, or you are at the main menu.
 
 ## What it can do

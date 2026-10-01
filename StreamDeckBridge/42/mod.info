@@ -1,10 +1,10 @@
 name=Stream Deck Bridge
 id=StreamDeckBridge
-description=Puts your survivor on an Elgato Stream Deck: health and what the game's Health tab lists for each body part, moodles, the time and weather, your weapon, your load, and the car you are in with what the game's Vehicle Mechanics window lists for it (its overall condition and every part's condition), read once a second into a small file in your Zomboid folder for the Zomboid Deck plugin. In single player it also counts down to the power and water shutoff, using the game's own rule; on a server it says only whether they are on. A few keys can also sit you down, stand you up, switch your flashlight or headlights, start the engine or stop what you are doing, using the game's own actions. Client-side only, no cheats, and nothing leaves your PC. Needs the Zomboid Deck plugin for Stream Deck.
+description=Puts your survivor on an Elgato Stream Deck: health and what the game's Health tab lists for each body part, moodles, the time and weather, your weapon, your load, the car you are in with what the game's Vehicle Mechanics window lists for it (its overall condition and every part's condition), and the character window's Skills, Info, Protection and Temperature tabs (skill levels and progress, profession and traits, bite and scratch defence per body part, and how warm you are as the tab shows it in a normal game), read once a second into a small file in your Zomboid folder for the Zomboid Deck plugin. In single player it also counts down to the power and water shutoff, using the game's own rule; on a server it says only whether they are on. A few keys can also sit you down, stand you up, switch your flashlight or headlights, start the engine or stop what you are doing, using the game's own actions. Client-side only, no cheats, and nothing leaves your PC. Needs the Zomboid Deck plugin for Stream Deck.
 poster=poster.png
 icon=icon.png
 category=features
 author=TeaTime
 url=https://teatimeservers.ca/plugins/zomboid-deck
-modversion=1.2.0
+modversion=1.3.0
 versionMin=42.20

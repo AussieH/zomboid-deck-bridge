@@ -3,20 +3,25 @@
 -- Once a second it writes what your survivor can see about themselves to Zomboid\Lua\StreamDeck\state.json: health,
 -- what the game's Health tab lists for each body part, the moodles the game is showing, the time and weather, what is
 -- in your hands, your load and the car you are in, with what the game's Vehicle Mechanics window lists for that car:
--- its overall condition and every part with its condition, in the window's colours. It also reads
+-- its overall condition and every part with its condition, in the window's colours. From 1.3.0 it also writes four tabs
+-- of the game's character window: Skills (every skill with its level, progress and book multiplier), Info (profession,
+-- traits, body weight and the rest of the tab), Protection (bite and scratch defence per body part) and Temperature (the
+-- core temperature and body heat bars and each body part's skin temperature, body response, insulation and wind
+-- resistance, as the tab shows them in a normal game). It also reads
 -- Zomboid\Lua\StreamDeck\command.json, where the plugin leaves a key press, runs it with the game's own action and
 -- empties the file.
 --
 -- Client-side only (media/lua/client), for the local player. It never changes a stat or spawns anything. The health
 -- section repeats the game's own Health tab and nothing more, so a zombie infection the tab does not show is never
--- written; the mechanics section repeats the Mechanics window and nothing more, without its debug-mode lines. In single
+-- written; the mechanics section repeats the Mechanics window and nothing more, without its debug-mode lines, and the
+-- character section repeats its tabs without theirs (the Temperature tab's raw numbers and reset button). In single
 -- player it also writes how long the grid's power and the mains water have left, worked out with the game's own rule;
 -- on a server (isClient()) it leaves that out and writes only whether they are on.
 
 StreamDeckBridge = StreamDeckBridge or {}
 local B = StreamDeckBridge
 
-B.VERSION = "1.2.0"
+B.VERSION = "1.3.0"
 B.PROTOCOL = 1
 B.STATE_FILE = "StreamDeck/state.json"
 B.COMMAND_FILE = "StreamDeck/command.json"
@@ -620,6 +625,237 @@ local function readMechanics(player)
     return out
 end
 
+-- ---------------------------------------------------------------------------------------------------------------
+-- The character window (1.3.0): four of the tabs of the window the game opens with J, L and P
+-- (media/lua/client/XpSystem/ISUI/ISCharacterInfoWindow.lua, Build 42.21, lines 127-148): Skills (ISCharacterInfo.lua and
+-- ISSkillProgressBar.lua), Info (ISCharacterScreen.lua), Protection (ISCharacterProtection.lua) and Temperature
+-- (ISClothingInsPanel.lua), rule for rule, line numbers from those files. Every tab is added for every player: none is
+-- debug-only. Their debug-mode extras are left out, so the deck shows what a normal game shows even when the game runs in
+-- debug mode: the Temperature tab's raw numbers (core temperature, "R =" and "real:", ISClothingInsPanel.lua:624-634) and
+-- its "-reset-" button (46-50); the Info tab's hair and beard debug menu options (358-364, 492-494).
+-- ---------------------------------------------------------------------------------------------------------------
+local function hexOf(c) return string.format("#%02x%02x%02x", math.floor(c[1] * 255 + 0.5), math.floor(c[2] * 255 + 0.5), math.floor(c[3] * 255 + 0.5)) end
+
+-- The Skills tab. ISCharacterInfo.loadPerk (265-285): every perk in PerkFactory.PerkList whose parent is not Perks.None,
+-- grouped under its parent. createChildren (27-45): the groups sorted passive first, then by name with
+-- "not string.sort(a, b)" (Kahlua's string.sort(a, b) is a:compareTo(b) > 0, javap 42.21, so a <= b; the same order is
+-- asked for here as a strict a < b, which table.sort needs). 57-60: the skills in each group sorted by name (sortRecipes,
+-- 10-13).
+local XP_GETTERS = { "getXp1", "getXp2", "getXp3", "getXp4", "getXp5", "getXp6", "getXp7", "getXp8", "getXp9", "getXp10" }
+-- ISSkillProgressBar.getPreviousXpLvl (254-288): the XP of every level below this one, xp1 to xp<level>.
+function B.previousXp(perk, level)
+    local total = 0
+    for i = 1, math.min(level, 10) do total = total + (num(perk[XP_GETTERS[i]](perk)) or 0) end
+    return total
+end
+local function readSkill(player, perk)
+    local xp = player:getXp()
+    local level = player:getPerkLevel(perk)
+    -- 135-152: the name's colour by the starting XP boost: 0 is 0.54 grey, 1 is 0.8 grey, 2 white, 3 (1, 0.83, 0)
+    local boost = num(try(function() return xp:getPerkBoost(perk) end)) or 0
+    -- 155: the ">, >>, >>>" arrows run while the skill's multiplier (a skill book) is over 0
+    local mult = num(try(function() return xp:getMultiplier(perk) end)) or 0
+    local out = { id = try(function() return perk:getId() end) or perk:getName(), name = perk:getName(), level = level, boost = boost,
+        mult = mult > 0 and round(mult, 2) or nil, passive = try(function() return perk:isPassiv() end) or nil }
+    if level < 10 then
+        -- ISSkillProgressBar 133-145, 250-252, 290-292: XP into this level, over getXpForLevel(level + 1), never above it
+        local need = num(perk:getXpForLevel(level + 1))
+        local have = (num(xp:getXP(perk)) or 0) - B.previousXp(perk, level)
+        if need and need > 0 then
+            out.need = need
+            out.xp = math.max(0, math.min(have, need))
+        end
+    end
+    return out
+end
+local function readSkills(player)
+    local groups, byParent = {}, {}
+    local list = PerkFactory.PerkList
+    for i = 0, list:size() - 1 do
+        local perk = list:get(i)
+        local parent = perk:getParent()
+        if parent ~= Perks.None then
+            if not byParent[parent] then
+                byParent[parent] = { perk = parent, skills = {} }
+                groups[#groups + 1] = byParent[parent]
+            end
+            table.insert(byParent[parent].skills, perk)
+        end
+    end
+    local sorted = type(string.sort) == "function" and function(a, b) return string.sort(b, a) end or function(a, b) return a < b end
+    table.sort(groups, function(a, b)
+        local pa, pb = a.perk:isPassiv(), b.perk:isPassiv()
+        if pa ~= pb then return pa end
+        return sorted(a.perk:getName(), b.perk:getName())
+    end)
+    local out = {}
+    for _, g in ipairs(groups) do
+        table.sort(g.skills, function(a, b) return a:getName() < b:getName() end)
+        local skills = {}
+        for _, perk in ipairs(g.skills) do
+            local s = try(readSkill, player, perk)
+            if s then skills[#skills + 1] = s end
+        end
+        out[#out + 1] = { name = g.perk:getName(), skills = skills }
+    end
+    return out
+end
+
+-- The Info tab (ISCharacterScreen.lua). Its name line is left out, as everywhere in the bridge. In 42.21 the tab works out
+-- the sex text (63-66) but draws neither it nor an age, and its Survivors Killed line is commented out (230-236), so none
+-- of those is sent.
+local function readInfo(player, good, bad)
+    local out = {}
+    -- loadProfession (638-648): the profession's UI name
+    out.profession = try(function()
+        local def = CharacterProfessionDefinition.getCharacterProfessionDefinition(player:getDescriptor():getCharacterProfession())
+        return def and def:getUIName() or nil
+    end)
+    -- 116-130: the body weight, round(getNutrition():getWeight(), 0), and the chevron for gaining, gaining a lot or losing
+    local nutrition = try(function() return player:getNutrition() end)
+    if nutrition then
+        local w = num(try(function() return nutrition:getWeight() end))
+        if w then out.weight = round(w, 0) end
+        local lot = try(function() return nutrition:isIncWeightLot() end) == true
+        local up = try(function() return nutrition:isIncWeight() end) == true
+        local down = try(function() return nutrition:isDecWeight() end) == true
+        if up and not lot then out.trend = "up" end
+        if lot then out.trend = "upLot" end
+        if down then out.trend = "down" end
+    end
+    -- setDisplayedTraits (575-584): every known trait whose CharacterTraitDefinition has a picture, in the list's order,
+    -- shown as its label; coloured as character creation colours traits (CharacterCreationProfession.lua:973-985): a cost
+    -- over 0 in the good highlight colour, under 0 in the bad one, otherwise white
+    out.traits = try(function()
+        local list = player:getCharacterTraits():getKnownTraits()
+        local traits = {}
+        for i = 0, list:size() - 1 do
+            local def = CharacterTraitDefinition.getCharacterTraitDefinition(list:get(i))
+            if def and def:getTexture() then
+                local cost = num(def:getCost()) or 0
+                traits[#traits + 1] = { label = def:getLabel(), cost = cost, color = cost > 0 and hexOf(good) or cost < 0 and hexOf(bad) or "#ffffff" }
+            end
+        end
+        return traits
+    end) or {}
+    -- loadBeardAndHairStyle (618-636): the hair style's name, Bald for none; a man's beard, None for none
+    local female = try(function() return player:isFemale() end) == true
+    out.hair = try(function()
+        local styles, model = getHairStylesInstance(), player:getHumanVisual():getHairModel()
+        local style = female and styles:FindFemaleStyle(model) or styles:FindMaleStyle(model)
+        if style and style:getName() ~= "" then return getText("IGUI_Hair_" .. style:getName()) end
+        return getText("IGUI_Hair_Bald")
+    end)
+    if not female then
+        out.beard = try(function()
+            local style = getBeardStylesInstance():FindStyle(player:getHumanVisual():getBeardModel())
+            if style and style:getName() ~= "" then return getText("IGUI_Beard_" .. style:getName()) end
+            return getText("IGUI_Beard_None")
+        end)
+    end
+    -- loadFavouriteWeapon (650-661): the "Fav:<weapon>" entry of the player's mod data with the most swings
+    -- (server/XpSystem/XpUpdate.lua:65-68 counts them)
+    out.favWeapon = try(function()
+        local best, swing = nil, 0
+        for k, v in pairs(player:getModData()) do
+            local name = type(k) == "string" and string.match(k, "^Fav:(.+)")
+            if name and type(v) == "number" and v > swing then best, swing = name, v end
+        end
+        return best
+    end)
+    -- 227-228: zombies killed
+    out.kills = num(try(function() return player:getZombieKills() end))
+    -- 237-241: "Survived For" and getTimeSurvived(), only while the clock shows the date
+    if try(function() local clock = UIManager.getClock(); return clock and clock:isDateVisible() end) then
+        out.survived = try(function() return player:getTimeSurvived() end)
+    end
+    out.labels = { weight = text("IGUI_char_Weight"), traits = text("IGUI_char_Traits"), hair = text("IGUI_char_HairStyle"),
+        beard = text("IGUI_char_BeardStyle"), favWeapon = text("IGUI_char_Favourite_Weapon"), kills = text("IGUI_char_Zombies_Killed"),
+        survived = text("IGUI_char_Survived_For") }
+    return out
+end
+
+-- The Protection tab (ISCharacterProtection.lua). render (74-114): the 17 body parts in BodyPartType order, each with
+-- its name (91), bite and scratch defence, floor(round(getBodyPartClothingDefense(i, bite, false))) (77-80), each in the
+-- colour of its own value (95, 100), and the body figure coloured by bite + scratch (89). Both colours come from the
+-- figure's scheme, bad highlight at 0 to good at 100 (19-22, 31), as ISBodyPartPanel:setColorForValue works it out
+-- (ISUI/BodyParts/ISBodyPartPanel.lua:326-358: the value clamped to 0-100, Color.interp between the two).
+function B.protectionColor(value, good, bad)
+    return B.conditionColor(math.max(0, math.min(100, value)), good, bad)
+end
+local function readProtection(player, good, bad)
+    local parts = {}
+    for i = 0, BodyPartType.ToIndex(BodyPartType.MAX) - 1 do
+        local t = BodyPartType.FromIndex(i)
+        local id = BodyPartType.ToString(t)
+        local bite = math.floor(round(player:getBodyPartClothingDefense(i, true, false), 0))
+        local scratch = math.floor(round(player:getBodyPartClothingDefense(i, false, false), 0))
+        parts[#parts + 1] = { id = id, name = BodyPartType.getDisplayName(t), bite = bite, scratch = scratch,
+            color = B.protectionColor(bite + scratch, good, bad), biteColor = B.protectionColor(bite, good, bad),
+            scratchColor = B.protectionColor(scratch, good, bad) }
+    end
+    return { parts = parts, labels = { part = text("IGUI_health_Part"), bite = text("IGUI_health_Bite"), scratch = text("IGUI_health_Scratch") } }
+end
+
+-- The Temperature tab (ISClothingInsPanel.lua), without its debug-only parts. prerender (614-669): the core temperature
+-- and body heat bars from the thermoregulator's getCoreTemperatureUI() and getHeatGenerationUI() (621-622, each 0-1
+-- along Cold-Normal-Hot and Low-Normal-High); the raw numbers beside their names are debug only (624-634) and are never
+-- read. Every body part's thermal node (636-642) gives each view's value through its "UI" getter (472-477), 0-1 along
+-- the view's bar: the default view's Skin Temperature, Body Response and Insulation (441-470) and the advanced view's
+-- Wind Resistance (429-438). Insulation and Wind Resistance also show their number when a part is picked, in a normal game
+-- too, rounded to 2 places (showValue, 426-427, 652-654; debug mode's 5 places are left out).
+B.TEMP_VIEWS = {
+    { "skin", "getSkinCelciusUI", "IGUI_Temp_SkinTemperature", "IGUI_Temp_Cold", "IGUI_Temp_Normal", "IGUI_Temp_Hot" },
+    { "response", "getBodyResponseUI", "IGUI_Temp_BodyResponse", "IGUI_Temp_FightCold", "IGUI_Temp_Normal", "IGUI_Temp_FightHot" },
+    { "insulation", "getInsulationUI", "IGUI_Temp_Insulation", "IGUI_Temp_Low", "IGUI_Temp_Med", "IGUI_Temp_High", "getInsulation" },
+    { "wind", "getWindresistUI", "IGUI_Temp_WindResistance", "IGUI_Temp_Low", "IGUI_Temp_Med", "IGUI_Temp_High", "getWindresist" },
+}
+local function readTemperature(player)
+    local thermos = player:getBodyDamage():getThermoregulator()
+    if not thermos then return nil end
+    local out = {
+        core = num(try(function() return thermos:getCoreTemperatureUI() end)),
+        heat = num(try(function() return thermos:getHeatGenerationUI() end)),
+        labels = { core = text("IGUI_Temp_CoreTemp"), heat = text("IGUI_Temp_BodyHeat"), cold = text("IGUI_Temp_Cold"), normal = text("IGUI_Temp_Normal"),
+            hot = text("IGUI_Temp_Hot"), low = text("IGUI_Temp_Low"), high = text("IGUI_Temp_High") },
+        views = {}, parts = {},
+    }
+    for _, v in ipairs(B.TEMP_VIEWS) do
+        out.views[#out.views + 1] = { id = v[1], title = text(v[3]), min = text(v[4]), mid = text(v[5]), max = text(v[6]) }
+    end
+    for i = 0, BodyPartType.ToIndex(BodyPartType.MAX) - 1 do
+        local t = BodyPartType.FromIndex(i)
+        local node = try(function() return thermos:getNodeForType(t) end)
+        if node then
+            local p = { id = BodyPartType.ToString(t), name = BodyPartType.getDisplayName(t) }
+            for _, v in ipairs(B.TEMP_VIEWS) do
+                p[v[1]] = num(try(function() return node[v[2]](node) end))
+                if v[7] then
+                    local raw = num(try(function() return node[v[7]](node) end))
+                    if raw then p[v[1] .. "Value"] = round(raw, 2) end
+                end
+            end
+            out.parts[#out.parts + 1] = p
+        end
+    end
+    return out
+end
+
+local function readCharacter(player)
+    local core = getCore()
+    local bad = rgbOf(function() return core:getBadHighlitedColor() end, { 1, 0, 0 })
+    local good = rgbOf(function() return core:getGoodHighlitedColor() end, { 0, 1, 0 })
+    return {
+        -- the good highlight colour: the skill squares of a skill that just levelled up start in it (ISSkillProgressBar.lua:8-11, 151-163)
+        good = hexOf(good),
+        skills = try(readSkills, player),
+        info = try(readInfo, player, good, bad),
+        protection = try(readProtection, player, good, bad),
+        temperature = try(readTemperature, player),
+    }
+end
+B.readCharacter = readCharacter
+
 function B.readState()
     local player = getSpecificPlayer(0)
     local s = {
@@ -664,6 +900,7 @@ function B.readState()
     s.place = try(readPlace, player)
     s.shutoff = try(readShutoff)
     s.body = try(readBody, player)
+    s.character = try(readCharacter, player)
     s.zombies = try(function()
         local st = player:getStats()
         return { visible = st:getNumVisibleZombies(), chasing = st:getNumChasingZombies() }
