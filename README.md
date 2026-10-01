@@ -30,6 +30,10 @@ here so you can see exactly what it does: it is all in one file,
   (ElecShutModifier and WaterShutModifier against the world's age), including "Instant" and never. On a server it
   leaves this out and writes only whether they are on, since knowing the day there would be an advantage.
 - The car you are in: speed, gear, fuel, engine running and its condition, headlights, and whether you are driving.
+- The game's Mechanics window for the vehicle you are in, rule for rule from `ISVehicleMechanics.lua`: the vehicle's name
+  and type, its Overall Condition, weight and engine power, and every part by category with its condition in the
+  window's colours ("Missing" for a part that has been taken off, and the battery's and gas tank's "% Remaining"),
+  plus which parts the car overlay draws. The window's debug-mode lines are left out.
 - Whether you are sitting or asleep, the game is paused, or you are at the main menu.
 
 ## What it can do

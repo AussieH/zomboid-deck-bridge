@@ -2,18 +2,21 @@
 --
 -- Once a second it writes what your survivor can see about themselves to Zomboid\Lua\StreamDeck\state.json: health,
 -- what the game's Health tab lists for each body part, the moodles the game is showing, the time and weather, what is
--- in your hands, your load and the car you are in. It also reads Zomboid\Lua\StreamDeck\command.json, where the plugin
--- leaves a key press, runs it with the game's own action and empties the file.
+-- in your hands, your load and the car you are in, with what the game's Vehicle Mechanics window lists for that car:
+-- its overall condition and every part with its condition, in the window's colours. It also reads
+-- Zomboid\Lua\StreamDeck\command.json, where the plugin leaves a key press, runs it with the game's own action and
+-- empties the file.
 --
 -- Client-side only (media/lua/client), for the local player. It never changes a stat or spawns anything. The health
 -- section repeats the game's own Health tab and nothing more, so a zombie infection the tab does not show is never
--- written. In single player it also writes how long the grid's power and the mains water have left, worked out with
--- the game's own rule; on a server (isClient()) it leaves that out and writes only whether they are on.
+-- written; the mechanics section repeats the Mechanics window and nothing more, without its debug-mode lines. In single
+-- player it also writes how long the grid's power and the mains water have left, worked out with the game's own rule;
+-- on a server (isClient()) it leaves that out and writes only whether they are on.
 
 StreamDeckBridge = StreamDeckBridge or {}
 local B = StreamDeckBridge
 
-B.VERSION = "1.1.0"
+B.VERSION = "1.2.0"
 B.PROTOCOL = 1
 B.STATE_FILE = "StreamDeck/state.json"
 B.COMMAND_FILE = "StreamDeck/command.json"
@@ -463,6 +466,160 @@ local function readBody(player)
     return out
 end
 
+-- ---------------------------------------------------------------------------------------------------------------
+-- The Mechanics window (1.2.0): what media/lua/client/Vehicles/ISUI/ISVehicleMechanics.lua (Build 42.21) shows about a
+-- vehicle, rule for rule, for the vehicle the player is sitting in, and which parts the car overlay beside its lists
+-- (ISCarMechanicsOverlay.lua, same folder) draws and in what colour. Line numbers are from those two files.
+-- From a seat, the vehicle's radial menu offers the window to the driver and passengers alike once the car has stopped
+-- (ISVehicleMenu.lua:185-188, no isDriver test), so every seat gets it.
+-- Left out: what the window shows only in debug mode or with the UnstableScriptNameSpam sandbox option (the "Vehicle
+-- Script:" line, 1165-1169), the selected part's detail panel (1234-1372, with its debug-only "DBG: Gain XP" line,
+-- 1334-1341), and the cheat and debug menus. The window has no Mechanics-skill rule for what it lists: the skill only
+-- gates repair and configure options in its menus (325-364, 651-717), which the bridge never reads.
+-- ---------------------------------------------------------------------------------------------------------------
+-- 81: the door, bodywork and lights categories go in the window's right-hand list, every other in the left.
+B.MECH_RIGHT = { door = true, bodywork = true, lights = true }
+
+local function rgbOf(getter, fallback)
+    local c = try(getter)
+    if not c then return fallback end
+    local r, g, b = num(try(function() return c:getR() end)), num(try(function() return c:getG() end)), num(try(function() return c:getB() end))
+    if r and g and b then return { r, g, b } end
+    return fallback
+end
+
+-- 1374-1380: getConditionRGB(condition) is the player's bad highlight colour interpolated towards the good one by
+-- condition / 100 (Color.interp, javap 42.21: this + (to - this) x delta), from getCore()'s highlight colours (pure red
+-- and pure green unless the player changed them).
+function B.conditionColor(condition, good, bad)
+    local t = condition / 100
+    local c = {}
+    for i = 1, 3 do c[i] = math.floor(math.max(0, math.min(1, bad[i] + (good[i] - bad[i]) * t)) * 255 + 0.5) end
+    return string.format("#%02x%02x%02x", c[1], c[2], c[3])
+end
+
+-- 1154-1162: the vehicle's name, getText("IGUI_VehicleName" .. carModelName or the script's name), and for a burnt
+-- script "Burnt %1" around the unburnt car's name when it has one.
+local function mechanicsName(vehicle)
+    local script = vehicle:getScript()
+    local carName = try(function() return script:getCarModelName() end) or script:getName()
+    local name = text("IGUI_VehicleName" .. carName)
+    local scriptName = script:getName()
+    if string.match(scriptName, "Burnt") then
+        local unburnt = (string.gsub(scriptName, "Burnt", ""))
+        local plain = try(getTextOrNull, "IGUI_VehicleName" .. unburnt)
+        if plain then name = plain end
+        name = try(getText, "IGUI_VehicleNameBurntCar", name) or name
+    end
+    return name
+end
+
+-- 914-916: the overlay is ISCarMechanicsOverlay.CarList[script:getCarMechanicsOverlay() or vehicle:getScriptName()];
+-- with no entry the window draws no car at all.
+local function overlayOf(vehicle)
+    if type(ISCarMechanicsOverlay) ~= "table" or type(ISCarMechanicsOverlay.CarList) ~= "table" then return nil end
+    local name = try(function() return vehicle:getScript():getCarMechanicsOverlay() end) or try(function() return vehicle:getScriptName() end)
+    return name and ISCarMechanicsOverlay.CarList[name] or nil
+end
+
+-- 921-941: the images the overlay draws for a part: the part's entry in ISCarMechanicsOverlay.PartList (no entry, no
+-- image), replaced by the car's own PartList entry when it has one (928-930), one image or several (multipleImg).
+local function overlayImages(props, id)
+    local pp = ISCarMechanicsOverlay.PartList and ISCarMechanicsOverlay.PartList[id]
+    if not pp then return nil end
+    if props.PartList and props.PartList[id] then pp = props.PartList[id] end
+    if pp.multipleImg then
+        local list = {}
+        for _, img in ipairs(pp.img) do list[#list + 1] = img end
+        return list
+    end
+    return { pp.img }
+end
+
+-- One line of the window's lists (doDrawItem, 856-894) and how the overlay colours the part.
+local function readPart(part, good, bad, props)
+    local id = part:getId()
+    -- 52-53: the category, "Other" when there is none; "nodisplay" parts are not listed
+    local category = try(function() return part:getCategory() end) or "Other"
+    if category == "nodisplay" then return nil end
+    local item = try(function() return part:getInventoryItem() end)
+    -- a condition that cannot be read (a renamed getter) leaves the part out rather than listing it at 0
+    local cond = num(part:getCondition())
+    if not cond then return nil end
+    local out = {
+        id = id,
+        -- 64, 59: the part's and the category's names, getText("IGUI_VehiclePart" .. id) and ("IGUI_VehiclePartCat" .. category)
+        name = text("IGUI_VehiclePart" .. id), cat = category, catName = text("IGUI_VehiclePartCat" .. category),
+        side = B.MECH_RIGHT[category] and "right" or "left", cond = cond,
+    }
+    if not item and try(function() return part:getTable("install") end) then
+        -- 870-871: an uninstalled part is listed by name alone, in the bad highlight colour, which is also the colour of
+        -- condition 0 the overlay gives it (924-926)
+        out.missing = true
+        out.color = B.conditionColor(0, good, bad)
+    else
+        -- 885-889: " (condition%)" in getConditionRGB(getCondition()); the name itself is 0.8 grey (873, partRGB 1521)
+        out.color = B.conditionColor(cond, good, bad)
+        if id == "Battery" then
+            -- 875-878: "Battery: N% Remaining", N = floor(getCurrentUsesFloat() x 100)
+            out.charge = math.floor(item:getCurrentUsesFloat() * 100)
+            out.extra = out.charge .. "% " .. text("IGUI_invpanel_Remaining")
+        elseif id == "GasTank" then
+            -- 879-882: "Gas Tank: N% Remaining", N = floor(content / capacity x 100)
+            local fuel = num(try(function() return math.floor(part:getContainerContentAmount() / part:getContainerCapacity() * 100) end))
+            if fuel then out.fuel = fuel; out.extra = fuel .. "% " .. text("IGUI_invpanel_Remaining") end
+        end
+    end
+    -- 931-934: on the overlay, alpha 0.9, pulsing when the condition is under 10 or the part is missing (the plugin
+    -- repeats that rule from cond and missing)
+    if props then out.ov = overlayImages(props, id) end
+    return out
+end
+
+local function readMechanics(player)
+    local vehicle = player:getVehicle()
+    if not vehicle then return nil end
+    local core = getCore()
+    local bad = rgbOf(function() return core:getBadHighlitedColor() end, { 1, 0, 0 })
+    local good = rgbOf(function() return core:getGoodHighlitedColor() end, { 0, 1, 0 })
+    local props = try(overlayOf, vehicle)
+    local out = {
+        id = try(function() return vehicle:getId() end),
+        name = try(mechanicsName, vehicle),
+        -- 1170: "Vehicle Type: " and getText("IGUI_VehicleType_" .. script:getMechanicType())
+        typeLabel = text("Tooltip_item_Mechanic"),
+        type = try(function() return text("IGUI_VehicleType_" .. vehicle:getScript():getMechanicType()) end),
+        -- 1175: the weight, getMass(); 1177-1179: the engine power, getEnginePower() / 10 hp, only with an Engine part
+        weight = num(try(function() return vehicle:getMass() end)),
+        power = try(function() if vehicle:getPartById("Engine") then return vehicle:getEnginePower() / 10 end end),
+        overlay = props and type(props.imgPrefix) == "string" and (string.gsub(props.imgPrefix, "_$", "")) or nil,
+        labels = { overall = text("IGUI_OverallCondition"), missing = text("IGUI_Missing") },
+    }
+    local parts, total, count = {}, 0, 0
+    for i = 1, vehicle:getPartCount() do
+        local part = vehicle:getPartByIndex(i - 1)
+        local p = try(readPart, part, good, bad, props)
+        if p then parts[#parts + 1] = p end
+        -- 104-120: the Overall Condition the window shows is recalculGeneralCondition(), which update() runs every frame
+        -- (26): every part, nodisplay ones too, at 0 when its item was taken out (getItemType() not empty and no
+        -- inventory item, 112), averaged and rounded to 2 places
+        local cond = num(try(function()
+            local c = part:getCondition()
+            local types = part:getItemType()
+            if types and not types:isEmpty() and not part:getInventoryItem() then c = 0 end
+            return c
+        end))
+        if cond then total = total + cond; count = count + 1 end
+    end
+    out.parts = parts
+    if count > 0 then
+        out.condition = math.floor(total / count * 100 + 0.5) / 100
+        -- 1172-1173: "Overall Condition: " and the number in getConditionRGB(the number)
+        out.color = B.conditionColor(out.condition, good, bad)
+    end
+    return out
+end
+
 function B.readState()
     local player = getSpecificPlayer(0)
     local s = {
@@ -502,6 +659,7 @@ function B.readState()
         return out
     end) or {}
     s.vehicle = try(readVehicle, player)
+    s.mechanics = try(readMechanics, player)
     s.weather = try(readWeather, player)
     s.place = try(readPlace, player)
     s.shutoff = try(readShutoff)
