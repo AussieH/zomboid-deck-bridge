@@ -7,7 +7,9 @@
 -- of the game's character window: Skills (every skill with its level, progress and book multiplier), Info (profession,
 -- traits, body weight and the rest of the tab), Protection (bite and scratch defence per body part) and Temperature (the
 -- core temperature and body heat bars and each body part's skin temperature, body response, insulation and wind
--- resistance, as the tab shows them in a normal game). It also reads
+-- resistance, as the tab shows them in a normal game). From 1.4.0 it also writes Zomboid\Lua\StreamDeck\inventory.json
+-- every 2 s when it changed: what the game's inventory window lists for the main inventory and each bag you wear or
+-- hold (name, count, category, weight and the line an open stack shows for each item). It also reads
 -- Zomboid\Lua\StreamDeck\command.json, where the plugin leaves a key press, runs it with the game's own action and
 -- empties the file.
 --
@@ -21,7 +23,7 @@
 StreamDeckBridge = StreamDeckBridge or {}
 local B = StreamDeckBridge
 
-B.VERSION = "1.3.0"
+B.VERSION = "1.4.0"
 B.PROTOCOL = 1
 B.STATE_FILE = "StreamDeck/state.json"
 B.COMMAND_FILE = "StreamDeck/command.json"
@@ -856,6 +858,275 @@ local function readCharacter(player)
 end
 B.readCharacter = readCharacter
 
+-- ---------------------------------------------------------------------------------------------------------------
+-- The inventory window (1.4.0): what the game's own inventory window shows you about what you carry, rule for rule:
+-- media/lua/client/ISUI/ISInventoryPage.lua (Build 42.21) for which containers get a button and the weight in its title
+-- bar, and ISInventoryPane.lua for the rows of each container. Line numbers are from those two files. It goes to its
+-- own file, Zomboid\Lua\StreamDeck\inventory.json, so state.json stays small.
+-- Left out: the pane's other sort orders (the player picks them by clicking a column header or in its filter menu,
+-- 185-272; the file keeps the order a new pane starts with), which rows are open or selected, the item tooltip, the
+-- icons' textures, the read tick (2327-2329), the skull for bleach or tainted water in a fluid container (2330-2333),
+-- the craft stars (2336-2340) and the hot and cold row tints (2438-2451). Nothing is read that the window does not show.
+-- ---------------------------------------------------------------------------------------------------------------
+B.INVENTORY_FILE = "StreamDeck/inventory.json"
+B.INVENTORY_MS = 2000            -- read every 2 s (real time), written only when something changed
+B.INVENTORY_REFRESH_MS = 10000   -- and rewritten unchanged after 10 s, so a reader that starts late gets a whole file
+B.INVENTORY_CAP = 65536          -- bytes: a bigger inventory is cut down (B.capInventory) and the file says so
+-- 12, 2578-2580: an open stack lists at most ISInventoryPane.MAX_ITEMS_IN_STACK_TO_RENDER (50) of its items
+B.STACK_ROWS = 50
+B.CUT_BARS = 5                   -- what B.capInventory leaves of a stack's bars before it drops rows
+
+-- 2646-2701, drawItemDetails: the line an open stack shows for each of its items, as { kind, fraction } (the bar's
+-- fill, which drawProgressBar clamps to 0-1, 2630-2631), or { kind } for burnt food, which gets no bar (2683), or nil
+-- where the line is only the item's name.
+function B.itemBar(item)
+    local f = function(name) return num(try(function() return item[name](item) end)) or 0 end
+    local yes = function(name) return try(function() return item[name](item) end) == true end
+    local frac = function(v) return round(math.max(0, math.min(1, v)), 2) end
+    -- 2657-2659: a weapon's condition over its maximum
+    if instanceof(item, "HandWeapon") then
+        local max = f("getConditionMax")
+        return { "condition", max > 0 and frac(f("getCondition") / max) or 0 }
+    end
+    -- 2660-2662: what is left of a drainable, unless its script hides it
+    if instanceof(item, "Drainable") and not try(function() return item:hasTag(ItemTag.HIDE_REMAINING) end) then
+        return { "remaining", frac(f("getCurrentUsesFloat")) }
+    end
+    -- 2663-2665: melting, out of 100
+    if f("getMeltingTime") > 0 then return { "melting", frac(f("getMeltingTime") / 100) } end
+    if instanceof(item, "Food") then
+        -- 2667-2685: cooking, once a cookable food that is not frozen is over 1.6 heat; burning past its minutes to cook
+        -- (the bar in the bad colour), burnt past its minutes to burn; no bar for food that is burnt
+        if yes("isIsCookable") and not yes("isFrozen") and f("getHeat") > 1.6 then
+            local ct, mtc, mtb = f("getCookingTime"), f("getMinutesToCook"), f("getMinutesToBurn")
+            local kind, v = "cooking", mtc > 0 and ct / mtc or 0
+            if ct > mtb then kind = "burnt"
+            elseif ct > mtc then kind = "burning"; v = mtb > mtc and (ct - mtc) / (mtb - mtc) or 1 end
+            if yes("isBurnt") then return { kind } end
+            return { kind, frac(v) }
+        end
+        -- 2686-2688: freezing, out of 100
+        if f("getFreezingTime") > 0 then return { "freezing", frac(f("getFreezingTime") / 100) } end
+        -- 2690-2693: how filling it is, minus its hunger change; none when it has none (2694-2695)
+        local hunger = f("getHungerChange")
+        if hunger ~= 0 then return { "nutrition", frac(-hunger) } end
+    end
+    return nil
+end
+
+-- 2052-2073: what the pane marks on the player's own inventory window (self.parent.onCharacter): everything worn and
+-- what is in either hand is "equipped", and the hotbar's attached items are "in the hotbar" (getPlayerHotbar,
+-- ISPlayerData.lua:105-109).
+local function marksOf(player)
+    local equipped, hotbar = {}, {}
+    try(function()
+        local worn = player:getWornItems()
+        for i = 1, worn:size() do equipped[worn:get(i - 1):getItem()] = true end
+    end)
+    local primary, secondary = try(function() return player:getPrimaryHandItem() end), try(function() return player:getSecondaryHandItem() end)
+    if primary then equipped[primary] = true end
+    if secondary then equipped[secondary] = true end
+    try(function()
+        local bar = getPlayerHotbar(player:getPlayerNum())
+        if bar and bar.attachedItems then for _, item in pairs(bar.attachedItems) do hotbar[item] = true end end
+    end)
+    return equipped, hotbar
+end
+
+-- 226-232, itemSortByNameInc, the order a new pane starts in (2878): equipped rows last, rows in the hotbar first, then by
+-- the row's key with "not string.sort(a, b)" (a <= b in Kahlua, see the Skills tab above; asked here as the strict a < b
+-- table.sort needs).
+local function sortRows(rows)
+    local before = type(string.sort) == "function" and function(a, b) return string.sort(b, a) end or function(a, b) return a < b end
+    table.sort(rows, function(a, b)
+        if a.eq ~= b.eq then return b.eq end
+        if a.hb ~= b.hb then return a.hb end
+        if a.k == b.k then return a.i < b.i end
+        return before(a.k, b.k)
+    end)
+end
+
+-- refreshContainer (2032-2201): one row per stack, as the pane groups a container's items.
+function B.inventoryRows(player, container, equipped, hotbar)
+    local rows, byKey = {}, {}
+    local items = container:getItems()
+    local mainInv = try(function() return player:getInventory() end)
+    for i = 0, items:size() - 1 do
+        local item = items:get(i)
+        -- 2096: hidden items (the models of what is equipped) are not listed
+        if not try(function() return item:isHidden() end) then
+            -- 2100: the name the pane groups by, item:getName(player). (2101-2121: the pane renames berries and mushrooms
+            -- for the Herbalist recipe with item:setName; the bridge changes nothing, so it reads the name the pane gave.)
+            local name = try(function() return item:getName(player) end) or try(function() return item:getDisplayName() end) or "?"
+            local key, eq, hb = name, false, false
+            -- 2124-2138: worn or held items stack apart as "equipped:", key rings in the main inventory as "keyring:",
+            -- and other items in the hotbar as "hotbar:"
+            local keyring = false
+            if equipped[item] then key = "equipped:" .. key; eq = true
+            elseif (try(function() return item:isItemType(ItemType.KEY_RING) end) or try(function() return item:hasTag(ItemTag.KEY_RING) end))
+                and try(function() return mainInv:contains(item) end) then key = "keyring:" .. key; eq = true; keyring = true end
+            if hotbar[item] then
+                hb = true
+                if not eq then key = "hotbar:" .. key end
+            end
+            local row = byKey[key]
+            if not row then
+                row = { k = key, i = #rows, eq = eq, hb = hb, keyring = keyring, first = item, items = {}, weight = 0 }
+                byKey[key] = row
+                rows[#rows + 1] = row
+            end
+            row.items[#row.items + 1] = item
+            -- 2164: the stack's weight, each item's getUnequippedWeight()
+            row.weight = row.weight + (num(try(function() return item:getUnequippedWeight() end)) or 0)
+        end
+    end
+    sortRows(rows)
+    local out = {}
+    for _, row in ipairs(rows) do
+        local item = row.first
+        -- 2170, 2546-2550: the category the row shows and sorts by, the item's display category or else its category,
+        -- shown as getText("IGUI_ItemCat_" .. it)
+        local catKey = try(function() return item:getDisplayCategory() end) or try(function() return item:getCategory() end) or "Item"
+        local r = {
+            -- 2493: the row's name, item:getName(player); 2509-2513: " (n)" after it when the stack holds more than one
+            name = try(function() return item:getName(player) end) or "?",
+            count = #row.items > 1 and #row.items or nil,
+            cat = text("IGUI_ItemCat_" .. catKey), catKey = catKey,
+            weight = round(row.weight, 2),
+            equipped = (row.eq and not row.keyring) or nil, keyring = row.keyring or nil, hotbar = row.hb or nil,
+            -- the marks on the row's icon (2318-2335) and its text colour (2496)
+            broken = try(function() return item:isBroken() end) or nil,
+            frozen = (instanceof(item, "Food") and try(function() return item:isFrozen() end)) or nil,
+            -- 2324: tainted food while the sandbox shows tainted water, or a poison the player knows of
+            poison = ((instanceof(item, "Food") and try(function() return item:isTainted() end)
+                and try(function() return getSandboxOptions():getOptionByName("EnableTaintedWaterText"):getValue() end))
+                or try(function() return player:isKnownPoison(item) end)) or nil,
+            favorite = try(function() return item:isFavorite() end) or nil,
+            unwanted = try(function() return item:isUnwanted(player) end) or nil,
+        }
+        -- 2553: the line each item of the open stack shows, the first B.STACK_ROWS of them
+        local bars, any = {}, false
+        for n = 1, math.min(#row.items, B.STACK_ROWS) do
+            local b = try(B.itemBar, row.items[n])
+            if b then any = true end
+            bars[n] = b or false
+        end
+        if any then r.bars = bars end
+        out[#out + 1] = r
+    end
+    return out
+end
+
+-- ISInventoryPage.refreshBackpacks (1537-1580) on the player's own window: the main inventory, then every container
+-- the player wears or holds, and every key ring, in the order they sit in the main inventory; each with its weight as
+-- the title bar shows it (630-632: round(getCapacityWeight(), 2), 1163-1167) out of its capacity (637: the player's
+-- getMaxWeight() for the main inventory; 1494: getEffectiveCapacity(player) for the others).
+function B.readInventory(player)
+    local inv = player:getInventory()
+    local equipped, hotbar = marksOf(player)
+    local list = { { name = text("IGUI_InventoryTooltip"), weight = round(num(try(function() return inv:getCapacityWeight() end)) or 0, 2),
+        capacity = num(try(function() return player:getMaxWeight() end)), container = inv } }
+    local items = inv:getItems()
+    for i = 0, items:size() - 1 do
+        local item = items:get(i)
+        -- 1572, as the game writes it: a "Container" item the player has equipped (IsoGameCharacter.isEquipped: worn or in
+        -- a hand, javap 42.21), or any key ring
+        local isBag = try(function()
+            return item:getCategory() == "Container" and player:isEquipped(item) or item:isItemType(ItemType.KEY_RING) or item:hasTag(ItemTag.KEY_RING)
+        end)
+        local bag = isBag and try(function() return item:getInventory() end)
+        if bag then
+            list[#list + 1] = { name = try(function() return item:getName() end) or "?", weight = round(num(try(function() return bag:getCapacityWeight() end)) or 0, 2),
+                capacity = num(try(function() return bag:getEffectiveCapacity(player) end)), container = bag }
+        end
+    end
+    local containers = {}
+    for _, c in ipairs(list) do
+        local rows = try(B.inventoryRows, player, c.container, equipped, hotbar)
+        if rows then containers[#containers + 1] = { name = c.name, weight = c.weight, capacity = c.capacity, rows = #rows, items = rows } end
+    end
+    local core = getCore()
+    return {
+        containers = containers,
+        -- 2653-2654: the bars in the good highlight colour; 2678-2680: burning in the bad one
+        good = hexOf(rgbOf(function() return core:getGoodHighlitedColor() end, { 0, 1, 0 })),
+        bad = hexOf(rgbOf(function() return core:getBadHighlitedColor() end, { 1, 0, 0 })),
+        labels = { item = text("IGUI_invpanel_Type"), category = text("IGUI_invpanel_Category"), condition = text("IGUI_invpanel_Condition"),
+            remaining = text("IGUI_invpanel_Remaining"), melting = text("IGUI_invpanel_Melting"), cooking = text("IGUI_invpanel_Cooking"),
+            burning = text("IGUI_invpanel_Burning"), burnt = text("IGUI_invpanel_Burnt"), freezing = text("IGUI_invpanel_FreezingTime"),
+            nutrition = text("IGUI_invpanel_Nutrition") },
+    }
+end
+
+-- The size cap. An inventory that encodes to more than B.INVENTORY_CAP bytes is cut down in two steps, and the file
+-- says what was done in "trimmed": first every stack keeps only its first B.CUT_BARS bars (trimmed.bars), then, if it
+-- is still too big, the lightest rows that are not equipped, key rings or in the hotbar go, lightest first, and each
+-- container lists what went by category in "rest" ({ cat, catKey, rows, count, weight }, heaviest first) (trimmed.rows).
+function B.capInventory(inv, cap)
+    cap = cap or B.INVENTORY_CAP
+    local size = string.len(encode(inv))
+    if size <= cap then return inv end
+    inv.trimmed = { cap = cap }
+    for _, c in ipairs(inv.containers) do
+        for _, r in ipairs(c.items) do
+            if r.bars and #r.bars > B.CUT_BARS then
+                local keep = {}
+                for n = 1, B.CUT_BARS do keep[n] = r.bars[n] end
+                r.bars = keep
+                inv.trimmed.bars = B.CUT_BARS
+            end
+        end
+    end
+    size = string.len(encode(inv))
+    if size <= cap then return inv end
+    local pool = {}
+    for ci, c in ipairs(inv.containers) do
+        for ri, r in ipairs(c.items) do
+            if not (r.equipped or r.keyring or r.hotbar) then pool[#pool + 1] = { ci = ci, ri = ri, r = r, len = string.len(encode(r)) + 1 } end
+        end
+    end
+    table.sort(pool, function(a, b)
+        if a.r.weight ~= b.r.weight then return a.r.weight < b.r.weight end
+        if a.ci ~= b.ci then return a.ci > b.ci end
+        return a.ri > b.ri
+    end)
+    local drop, dropped = {}, 0
+    -- each category's summary costs about as much as a short row, so a margin is kept for them
+    local margin = math.min(120 * 40, math.floor(cap / 8))
+    for _, p in ipairs(pool) do
+        if size + margin <= cap then break end
+        drop[p.r] = p.ci
+        size = size - p.len
+        dropped = dropped + 1
+    end
+    for ci, c in ipairs(inv.containers) do
+        local keep, rest, byCat = {}, {}, {}
+        for _, r in ipairs(c.items) do
+            if drop[r] == ci then
+                local g = byCat[r.catKey]
+                if not g then g = { cat = r.cat, catKey = r.catKey, rows = 0, count = 0, weight = 0 }; byCat[r.catKey] = g; rest[#rest + 1] = g end
+                g.rows = g.rows + 1
+                g.count = g.count + (r.count or 1)
+                g.weight = round(g.weight + r.weight, 2)
+            else
+                keep[#keep + 1] = r
+            end
+        end
+        if #rest > 0 then
+            table.sort(rest, function(a, b) if a.weight ~= b.weight then return a.weight > b.weight end return a.catKey < b.catKey end)
+            c.rest = rest
+        end
+        c.items = keep
+    end
+    inv.trimmed.rows = dropped
+    -- the last resort: no bars at all
+    if string.len(encode(inv)) > cap then
+        for _, c in ipairs(inv.containers) do for _, r in ipairs(c.items) do r.bars = nil end end
+        inv.trimmed.bars = 0
+    end
+    return inv
+end
+
 function B.readState()
     local player = getSpecificPlayer(0)
     local s = {
@@ -932,6 +1203,42 @@ function B.writeState(s)
         log("writing Zomboid/Lua/" .. B.STATE_FILE .. " (state " .. tostring(s.state) .. ", game " .. tostring(s.game) .. ")")
     end
     return true
+end
+
+-- The inventory file, written the same way (one whole file, "end": true last in the reader's eyes), only when what it
+-- holds changed or B.INVENTORY_REFRESH_MS have passed. It has its own seq; "at" is the same clock as state.json's.
+B.invSeq = 0
+B.lastInventory = nil
+B.lastInventoryAt = 0
+function B.writeInventory(inv, now)
+    inv.protocol = B.PROTOCOL
+    inv.mod = B.VERSION
+    local core = encode(inv)
+    if core == B.lastInventory and now - B.lastInventoryAt < B.INVENTORY_REFRESH_MS then return false end
+    B.invSeq = B.invSeq + 1
+    inv.at = now
+    inv.seq = B.invSeq
+    inv["end"] = true
+    local w = getFileWriter(B.INVENTORY_FILE, true, false)
+    if not w then
+        if not B.inventoryFailed then log("cannot write Zomboid/Lua/" .. B.INVENTORY_FILE); B.inventoryFailed = true end
+        return false
+    end
+    w:write(encode(inv))
+    w:close()
+    B.lastInventory = core
+    B.lastInventoryAt = now
+    return true
+end
+
+-- Read, cut to size and written, for a live survivor (not at the menu, loading or dead: the reader goes by state.json).
+function B.inventoryTick(now)
+    local player = getSpecificPlayer(0)
+    if not player or try(function() return player:isDead() end) then return false end
+    local inv = try(B.readInventory, player)
+    if not inv then return false end
+    inv = try(B.capInventory, inv) or inv
+    return try(B.writeInventory, inv, now) or false
 end
 
 function B.writeMenu()
@@ -1048,7 +1355,7 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 -- Timing: real time, not game time, so the deck keeps up at any game speed and while paused
 -- ---------------------------------------------------------------------------------------------------------------
-B.nextWrite, B.nextCommand, B.nextMenu = 0, 0, 0
+B.nextWrite, B.nextCommand, B.nextMenu, B.nextInventory = 0, 0, 0, 0
 
 function B.onTick()
     local now = getTimestampMs()
@@ -1061,6 +1368,10 @@ function B.onTick()
         B.nextWrite = now + B.WRITE_MS
         local s = try(B.readState)
         if s then wrote = try(B.writeState, s) end
+    end
+    if now >= B.nextInventory then
+        B.nextInventory = now + B.INVENTORY_MS
+        try(B.inventoryTick, now)
     end
     return wrote
 end

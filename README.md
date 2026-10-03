@@ -38,6 +38,10 @@ here so you can see exactly what it does: it is all in one file,
   weapon, kills, time survived), Skills (every skill's level, progress, starting boost and skill-book multiplier),
   Protection (bite and scratch protection per body part) and Temperature (the core temperature and body heat bars and
   the per-part views). The tabs' debug-mode extras, such as the raw temperature numbers, are never read.
+- Your inventory, rule for rule from the game's inventory window (`ISInventoryPage.lua`, `ISInventoryPane.lua`): the
+  main inventory, each bag you wear or hold and your key rings, with their weight, and every row the window shows
+  (name and count, category, weight, and its condition, remaining, cooking or freezing bars). It goes in a separate
+  file, `Zomboid\Lua\StreamDeck\inventory.json`, written when it changes, kept under 64 KB.
 - Whether you are sitting or asleep, the game is paused, or you are at the main menu.
 
 ## What it can do
