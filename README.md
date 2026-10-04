@@ -61,8 +61,11 @@ A press is run once (each carries an id) and dropped if it is more than five sec
 
 ## Installing
 
-The Zomboid Deck plugin installs it for you: **Install the mod** in any Zomboid Deck key's settings, with the game
-closed. By hand:
+The easy way: subscribe to [Stream Deck Bridge on the Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3813743791),
+and Steam keeps it up to date. A server adds it with Workshop ID `3813743791` and mod ID `StreamDeckBridge`.
+
+The Zomboid Deck plugin can also install it: **Install the mod** in any Zomboid Deck key's settings, with the game
+closed. Use one way, not both: with two copies the game may load the older one. By hand:
 
 1. Close Project Zomboid.
 2. Copy the `StreamDeckBridge` folder into `C:\Users\<you>\Zomboid\mods`, so you have
